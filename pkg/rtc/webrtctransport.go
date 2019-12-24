@@ -152,6 +152,11 @@ func (t *WebRTCTransport) AnswerPublish(rid string, offer webrtc.SessionDescript
 }
 
 func (t *WebRTCTransport) AnswerSubscribe(offer webrtc.SessionDescription, ssrcPT map[uint32]uint8, pid string) (answer webrtc.SessionDescription, err error) {
+	invalidSDP := webrtc.SessionDescription{}
+	if offer == invalidSDP || len(ssrcPT) == 0 || pid == "" {
+		log.Errorf("WebRTCTransport.AnswerSubscribe invalid param ssrcPT=%v pid=%v", ssrcPT, pid)
+		return webrtc.SessionDescription{}, errInvalidParam
+	}
 
 	mediaEngine := webrtc.MediaEngine{}
 	mediaEngine.RegisterDefaultCodecs()

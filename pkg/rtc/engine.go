@@ -89,14 +89,14 @@ func getOrNewPipeline(pid string) *pipeline {
 
 func DelPub(pid string) {
 	log.Infof("DelPub pid=%s", pid)
+	pipeLock.Lock()
+	defer pipeLock.Unlock()
 	p := getPipeline(pid)
 	if p == nil {
 		log.Infof("DelPub p=nil")
 		return
 	}
 	p.Close()
-	pipeLock.Lock()
-	defer pipeLock.Unlock()
 	delete(pipes, pid)
 }
 

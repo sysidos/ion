@@ -33,6 +33,7 @@ const (
 var (
 	cfg webrtc.Configuration
 
+	errInvalidParam  = errors.New("invalid param")
 	errChanClosed    = errors.New("channel closed")
 	errInvalidTrack  = errors.New("track not found")
 	errInvalidPacket = errors.New("packet is nil")

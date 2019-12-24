@@ -47,6 +47,7 @@ func streamAdd(rid, uid, mid, from string, ssrcPt map[string]interface{}) {
 		infoMap := redis.HGetAll(getUserInfoPath(rid, uid))
 		for info := range infoMap {
 			onStreamAdd := util.Map("method", proto.IslbOnStreamAdd, "rid", rid, "uid", uid, "mid", mid, "info", info)
+			log.Infof("streamAdd amqp.BroadCast %v", onStreamAdd)
 			amqp.BroadCast(onStreamAdd)
 		}
 		// keep watching mid

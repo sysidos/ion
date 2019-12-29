@@ -14,6 +14,9 @@ const (
 // Init init port and ice urls
 func Init(port int, ices []string) {
 
+	//init ice
+	initICE(ices)
+
 	// show stat about all pipelines
 	go func() {
 		t := time.NewTicker(statDuration)

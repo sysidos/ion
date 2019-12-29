@@ -14,6 +14,24 @@ import (
 	"github.com/pion/webrtc/v2"
 )
 
+const (
+	// for pli
+	pliDuration = 1 * time.Second
+
+	// for remb
+	rembDuration = 3 * time.Second
+	rembLowBW    = 30 * 1000
+	rembHighBW   = 100 * 1000
+)
+
+var (
+	cfg webrtc.Configuration
+
+	errChanClosed    = errors.New("channel closed")
+	errInvalidTrack  = errors.New("track not found")
+	errInvalidPacket = errors.New("packet is nil")
+)
+
 func initICE(ices []string) {
 	cfg = webrtc.Configuration{
 		SDPSemantics: webrtc.SDPSemanticsUnifiedPlanWithFallback,
@@ -25,13 +43,14 @@ func initICE(ices []string) {
 	}
 }
 
+// WebRTCTransport ..
 type WebRTCTransport struct {
 	id           string
 	pc           *webrtc.PeerConnection
 	track        map[uint32]*webrtc.Track
 	trackLock    sync.RWMutex
-	notify       chan struct{}
-	pli          chan int
+	stopCh       chan struct{}
+	pliCh        chan int
 	rtpCh        chan *rtp.Packet
 	wg           sync.WaitGroup
 	ssrcPT       map[uint32]uint8
@@ -48,8 +67,8 @@ func newWebRTCTransport(id string) *WebRTCTransport {
 	w := &WebRTCTransport{
 		id:     id,
 		track:  make(map[uint32]*webrtc.Track),
-		notify: make(chan struct{}),
-		pli:    make(chan int),
+		stopCh: make(chan struct{}),
+		pliCh:  make(chan int),
 		rtpCh:  make(chan *rtp.Packet, 1000),
 		ssrcPT: make(map[uint32]uint8),
 	}
@@ -57,10 +76,12 @@ func newWebRTCTransport(id string) *WebRTCTransport {
 	return w
 }
 
+// ID return id
 func (t *WebRTCTransport) ID() string {
 	return t.id
 }
 
+// AnswerPublish answer to pub
 func (t *WebRTCTransport) AnswerPublish(rid string, offer webrtc.SessionDescription, options map[string]interface{}, fn func(ssrc uint32, pt uint8)) (answer webrtc.SessionDescription, err error) {
 	if options == nil {
 		return webrtc.SessionDescription{}, errors.New("invalid options")
@@ -120,10 +141,10 @@ func (t *WebRTCTransport) AnswerPublish(rid string, offer webrtc.SessionDescript
 			go func() {
 				for {
 					select {
-					case <-t.pli:
+					case <-t.pliCh:
 						log.Debugf("WebRTCTransport.AnswerPublish WriteRTCP PLI %v", remoteTrack.SSRC())
 						t.pc.WriteRTCP([]rtcp.Packet{&rtcp.PictureLossIndication{SenderSSRC: remoteTrack.SSRC(), MediaSSRC: remoteTrack.SSRC()}})
-					case <-t.notify:
+					case <-t.stopCh:
 						t.wg.Done()
 						return
 					}
@@ -151,12 +172,7 @@ func (t *WebRTCTransport) AnswerPublish(rid string, offer webrtc.SessionDescript
 	return answer, err
 }
 
-func (t *WebRTCTransport) AnswerSubscribe(offer webrtc.SessionDescription, ssrcPT map[uint32]uint8, pid string) (answer webrtc.SessionDescription, err error) {
-	invalidSDP := webrtc.SessionDescription{}
-	if offer == invalidSDP || len(ssrcPT) == 0 || pid == "" {
-		log.Errorf("WebRTCTransport.AnswerSubscribe invalid param ssrcPT=%v pid=%v", ssrcPT, pid)
-		return webrtc.SessionDescription{}, errInvalidParam
-	}
+func (t *WebRTCTransport) AnswerSubscribe(offer webrtc.SessionDescription, ssrcPT map[uint32]uint8, mid string) (answer webrtc.SessionDescription, err error) {
 
 	mediaEngine := webrtc.MediaEngine{}
 	mediaEngine.RegisterDefaultCodecs()
@@ -190,7 +206,7 @@ func (t *WebRTCTransport) AnswerSubscribe(offer webrtc.SessionDescription, ssrcP
 
 	answer, err = t.pc.CreateAnswer(nil)
 	err = t.pc.SetLocalDescription(answer)
-	t.SubReceiveRTCP(pid)
+	t.subReadRTCP(mid)
 	return answer, err
 }
 
@@ -203,8 +219,8 @@ func (t *WebRTCTransport) sendPLI() {
 			for {
 				select {
 				case <-ticker.C:
-					t.pli <- 1
-				case <-t.notify:
+					t.pliCh <- 1
+				case <-t.stopCh:
 					t.wg.Done()
 					return
 				}
@@ -220,7 +236,7 @@ func (t *WebRTCTransport) receiveRTP(remoteTrack *webrtc.Track) {
 	total := uint64(0)
 	for {
 		select {
-		case <-t.notify:
+		case <-t.stopCh:
 			t.wg.Done()
 			return
 		case <-ticker.C:
@@ -242,6 +258,7 @@ func (t *WebRTCTransport) receiveRTP(remoteTrack *webrtc.Track) {
 	}
 }
 
+// ReadRTP read rtp packet
 func (t *WebRTCTransport) ReadRTP() (*rtp.Packet, error) {
 	rtp, ok := <-t.rtpCh
 	if !ok {
@@ -250,6 +267,7 @@ func (t *WebRTCTransport) ReadRTP() (*rtp.Packet, error) {
 	return rtp, nil
 }
 
+// WriteRTP send rtp packet
 func (t *WebRTCTransport) WriteRTP(pkt *rtp.Packet) error {
 	if pkt == nil {
 		return errInvalidPacket
@@ -265,17 +283,19 @@ func (t *WebRTCTransport) WriteRTP(pkt *rtp.Packet) error {
 	return errInvalidTrack
 }
 
+// Close all
 func (t *WebRTCTransport) Close() {
 	log.Infof("WebRTCTransport.Close t.ID()=%v", t.ID())
 	// close pc first, otherwise remoteTrack.ReadRTP will be blocked
 	t.pc.Close()
-	// close notify before rtpCh, otherwise panic: send on closed channel
-	close(t.notify)
+	// close stopCh before rtpCh, otherwise panic: send on closed channel
+	close(t.stopCh)
 	t.wg.Wait()
 	close(t.rtpCh)
-	close(t.pli)
+	close(t.pliCh)
 }
 
+// not used
 func (t *WebRTCTransport) pubReceiveRTCP() {
 	receivers := t.pc.GetReceivers()
 	for i := 0; i < len(receivers); i++ {
@@ -283,7 +303,7 @@ func (t *WebRTCTransport) pubReceiveRTCP() {
 		go func(i int) {
 			for {
 				select {
-				case <-t.notify:
+				case <-t.stopCh:
 					t.wg.Done()
 					return
 				default:
@@ -338,14 +358,14 @@ func (t *WebRTCTransport) pubReceiveRTCP() {
 	}
 }
 
-func (t *WebRTCTransport) SubReceiveRTCP(pid string) {
+func (t *WebRTCTransport) subReadRTCP(mid string) {
 	senders := t.pc.GetSenders()
 	for i := 0; i < len(senders); i++ {
 		t.wg.Add(1)
 		go func(i int) {
 			for {
 				select {
-				case <-t.notify:
+				case <-t.stopCh:
 					t.wg.Done()
 					return
 				default:
@@ -361,14 +381,13 @@ func (t *WebRTCTransport) SubReceiveRTCP(pid string) {
 						switch pkt[i].(type) {
 						case *rtcp.PictureLossIndication:
 							// pub is already sending PLI now
-							// SendPLI(pid)
 						case *rtcp.TransportLayerNack:
 							log.Debugf("rtcp.TransportLayerNack pkt[i]=%v", pkt[i])
 							nack := pkt[i].(*rtcp.TransportLayerNack)
 							for _, nackPair := range nack.Nacks {
 								sns := nackPair.PacketList()
 								for _, sn := range sns {
-									if !getPipeline(pid).writePacket(t.id, nack.MediaSSRC, sn) {
+									if !getPipeline(mid).writePacket(t.id, nack.MediaSSRC, sn) {
 										n := &rtcp.TransportLayerNack{
 											//origin ssrc
 											SenderSSRC: nack.SenderSSRC,
@@ -376,14 +395,14 @@ func (t *WebRTCTransport) SubReceiveRTCP(pid string) {
 											Nacks:      []rtcp.NackPair{rtcp.NackPair{PacketID: sn}},
 										}
 										log.Debugf("sendNack to pub %v", n)
-										getPipeline(pid).getPub().sendNack(n)
+										getPipeline(mid).getPub().sendNack(n)
 									}
 								}
 							}
 						case *rtcp.ReceiverEstimatedMaximumBitrate:
 						case *rtcp.ReceiverReport:
 						default:
-							log.Debugf("WebRTCTransport.SubReceiveRTCP rtcp type = %v", pkt[i])
+							log.Debugf("WebRTCTransport.subReceiveRTCP rtcp type = %v", pkt[i])
 						}
 					}
 				}
@@ -392,7 +411,8 @@ func (t *WebRTCTransport) SubReceiveRTCP(pid string) {
 	}
 }
 
-func (t *WebRTCTransport) SsrcPT() map[uint32]uint8 {
+// SSRCPT get SSRC and PayloadType
+func (t *WebRTCTransport) SSRCPT() map[uint32]uint8 {
 	t.ssrcPTLock.RLock()
 	defer t.ssrcPTLock.RUnlock()
 	return t.ssrcPT

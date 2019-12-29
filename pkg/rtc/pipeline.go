@@ -1,7 +1,6 @@
 package rtc
 
 import (
-	"strings"
 	"sync"
 	"time"
 
@@ -11,37 +10,46 @@ import (
 )
 
 const (
-	maxErrCnt = 100
+	maxErrCnt       = 100
+	maxPipelineSize = 1024
+	jitterBuffer    = "JB"
 )
 
-type Handler interface {
+type middleware interface {
 	ID() string
 	Push(*rtp.Packet) error
 	Stop()
 }
 
+// pipeline is a rtp pipeline
+//                               +----->Transport
+//                               |
+// pub--->middleware1--->...--->out----->Transport
+//                               |
+//                               +----->Transport
+
 type pipeline struct {
-	pub                               Transport
-	sub                               map[string]Transport
-	subLock                           sync.RWMutex
-	handler                           []Handler
-	handlerLock                       sync.RWMutex
-	pubCh                             chan *rtp.Packet
-	subCh                             chan *rtp.Packet
-	stopInCh, stopHandleCh, stopOutCh chan struct{}
-	wg                                sync.WaitGroup
+	pub                          Transport
+	sub                          map[string]Transport
+	subLock                      sync.RWMutex
+	handler                      []middleware
+	handlerLock                  sync.RWMutex
+	pubCh                        chan *rtp.Packet
+	subCh                        chan *rtp.Packet
+	stopInCh, stopMCh, stopOutCh chan struct{}
+	wg                           sync.WaitGroup
 }
 
 func newPipeline(id string) *pipeline {
 	p := &pipeline{
-		sub:          make(map[string]Transport),
-		pubCh:        make(chan *rtp.Packet, maxPipelineSize),
-		subCh:        make(chan *rtp.Packet, maxPipelineSize),
-		stopInCh:     make(chan struct{}),
-		stopHandleCh: make(chan struct{}),
-		stopOutCh:    make(chan struct{}),
+		sub:       make(map[string]Transport),
+		pubCh:     make(chan *rtp.Packet, maxPipelineSize),
+		subCh:     make(chan *rtp.Packet, maxPipelineSize),
+		stopInCh:  make(chan struct{}),
+		stopMCh:   make(chan struct{}),
+		stopOutCh: make(chan struct{}),
 	}
-	p.addHandler(jitterBuffer, newBuffer(jitterBuffer, p))
+	p.addMiddleware(jitterBuffer, newBuffer(jitterBuffer, p))
 	p.start()
 	return p
 }
@@ -73,7 +81,7 @@ func (p *pipeline) handle() {
 		defer util.Recover("[pipeline.handle]")
 		for {
 			select {
-			case <-p.stopHandleCh:
+			case <-p.stopMCh:
 				p.wg.Done()
 				return
 			default:
@@ -88,7 +96,7 @@ func (p *pipeline) handle() {
 				// if pkt.PayloadType == webrtc.DefaultPayloadTypeVP8 ||
 				// pkt.PayloadType == webrtc.DefaultPayloadTypeVP9 ||
 				// pkt.PayloadType == webrtc.DefaultPayloadTypeH264 {
-				// go p.getHandler(jitterBuffer).Push(pkt)
+				// go p.getMiddleware(jitterBuffer).Push(pkt)
 				// }
 			}
 		}
@@ -134,7 +142,7 @@ func (p *pipeline) out() {
 							rt := t.(*RTPTransport)
 							if err := rt.WriteRTP(pkt); err != nil {
 								log.Errorf("rt.WriteRTP err=%v", err)
-								rt.ResetExtSent()
+								rt.resetExtSent()
 								if rt.errCnt() > maxErrCnt {
 									p.delSub(t.ID())
 								}
@@ -238,21 +246,7 @@ func (p *pipeline) delSub(id string) {
 		p.sub[id].Close()
 	}
 	delete(p.sub, id)
-	log.Infof("pipeline.delSub id=%s", id)
-}
-
-func (p *pipeline) delSubByPrefix(id string) {
-	p.subLock.Lock()
-	defer p.subLock.Unlock()
-	for k, sub := range p.sub {
-		if strings.Contains(k, id) {
-			if sub != nil {
-				sub.Close()
-				delete(p.sub, k)
-				log.Infof("pipeline.delSubByPrefix id=%s", id)
-			}
-		}
-	}
+	log.Infof("pipeline.DelSub id=%s", id)
 }
 
 func (p *pipeline) delSubs() {
@@ -266,16 +260,16 @@ func (p *pipeline) delSubs() {
 	p.sub = make(map[string]Transport)
 }
 
-func (p *pipeline) addHandler(id string, t Handler) {
+func (p *pipeline) addMiddleware(id string, m middleware) {
 	p.handlerLock.Lock()
 	defer p.handlerLock.Unlock()
-	p.handler = append(p.handler, t)
+	p.handler = append(p.handler, m)
 }
 
-func (p *pipeline) getHandler(id string) Handler {
+func (p *pipeline) getMiddleware(id string) middleware {
 	p.handlerLock.RLock()
 	defer p.handlerLock.RUnlock()
-	// log.Infof("getHandler id=%s handler=%v", id, p.handler)
+	// log.Infof("getMiddleware id=%s handler=%v", id, p.handler)
 	for i := 0; i < len(p.handler); i++ {
 		if p.handler[i].ID() == id {
 			// log.Infof("==id return p ")
@@ -285,7 +279,7 @@ func (p *pipeline) getHandler(id string) Handler {
 	return nil
 }
 
-func (p *pipeline) delHandler(id string) {
+func (p *pipeline) delMiddleware(id string) {
 	p.handlerLock.Lock()
 	defer p.handlerLock.Unlock()
 	for i := 0; i < len(p.handler); i++ {
@@ -296,7 +290,7 @@ func (p *pipeline) delHandler(id string) {
 	}
 }
 
-func (p *pipeline) delHandlers() {
+func (p *pipeline) delMiddlewares() {
 	p.handlerLock.Lock()
 	defer p.handlerLock.Unlock()
 	for _, handler := range p.handler {
@@ -306,16 +300,17 @@ func (p *pipeline) delHandlers() {
 	}
 }
 
+// Close release all
 func (p *pipeline) Close() {
 	// for ReadRTP not block
 	p.delPub()
 	close(p.stopInCh)
-	close(p.stopHandleCh)
+	close(p.stopMCh)
 	close(p.stopOutCh)
 	close(p.pubCh)
 	p.wg.Wait()
 	p.delSubs()
-	p.delHandlers()
+	p.delMiddlewares()
 	close(p.subCh)
 }
 
@@ -323,7 +318,7 @@ func (p *pipeline) writePacket(sid string, ssrc uint32, sn uint16) bool {
 	if p.pub == nil {
 		return false
 	}
-	hd := p.getHandler(jitterBuffer)
+	hd := p.getMiddleware(jitterBuffer)
 	if hd != nil {
 		jb := hd.(*buffer)
 		pkt := jb.GetPacket(ssrc, sn)

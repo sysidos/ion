@@ -167,7 +167,7 @@ func publish(peer *signal.Peer, msg map[string]interface{}, accept signal.Accept
 		}()
 	}
 
-	answer, err := rtc.AddNewWebRTCPub(mid).AnswerPublish(room.ID(), jsep, options, islbStoreSsrc)
+	answer, err := rtc.NewWebRTCTransport(mid, "", true).AnswerPublish(room.ID(), jsep, options, islbStoreSsrc)
 	if err != nil {
 		log.Errorf("biz.publish answer err=%s jsep=%v", err.Error(), jsep)
 		reject(codePublishErr, codeStr(codePublishErr))
@@ -188,17 +188,15 @@ func unpublish(peer *signal.Peer, msg map[string]interface{}, accept signal.Acce
 
 	mid := util.Val(msg, "mid")
 	// if this mid is a webrtc pub
-	if rtc.IsWebRtcPub(mid) {
-		// tell islb stream-remove, `rtc.DelPub(mid)` will be done when islb braodcast stream-remove
-		quitChMapLock.Lock()
-		for k := range quitChMap {
-			if strings.Contains(k, mid) {
-				close(quitChMap[k])
-				delete(quitChMap, k)
-			}
+	// tell islb stream-remove, `rtc.DelPub(mid)` will be done when islb braodcast stream-remove
+	quitChMapLock.Lock()
+	for k := range quitChMap {
+		if strings.Contains(k, mid) {
+			close(quitChMap[k])
+			delete(quitChMap, k)
 		}
-		quitChMapLock.Unlock()
 	}
+	quitChMapLock.Unlock()
 
 	accept(emptyMap)
 }
@@ -218,15 +216,15 @@ func subscribe(peer *signal.Peer, msg map[string]interface{}, accept signal.Acce
 	jsep := webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: sdp}
 	var answer webrtc.SessionDescription
 	var err error
-	webrtcSub := rtc.AddNewWebRTCSub(mid, peer.ID())
+	webrtcSub := rtc.NewWebRTCTransport(mid, peer.ID(), false)
 	pub := rtc.GetPub(mid)
 	switch pub.(type) {
 	case *rtc.WebRTCTransport:
 		//pub is on this ion
 		wt := pub.(*rtc.WebRTCTransport)
-		ssrcPT := wt.SsrcPT()
+		ssrcPT := wt.SSRCPT()
 		// waiting two payload type
-		for i := 0; len(ssrcPT) < 2; ssrcPT = wt.SsrcPT() {
+		for i := 0; len(ssrcPT) < 2; ssrcPT = wt.SSRCPT() {
 			if i > 20 {
 				break
 			}
@@ -243,8 +241,8 @@ func subscribe(peer *signal.Peer, msg map[string]interface{}, accept signal.Acce
 	case *rtc.RTPTransport:
 		// the pub is on other ion, rtp pub already exist
 		rt := pub.(*rtc.RTPTransport)
-		ssrcPT := rt.SsrcPT()
-		for i := 0; len(ssrcPT) < 2; ssrcPT = rt.SsrcPT() {
+		ssrcPT := rt.SSRCPT()
+		for i := 0; len(ssrcPT) < 2; ssrcPT = rt.SSRCPT() {
 			if i > 20 {
 				break
 			}

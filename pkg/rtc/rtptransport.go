@@ -35,11 +35,11 @@ type RTPTransport struct {
 	extSent      int
 	// id == mid if this is a pub
 	// id != mid if this is a sub
-	id       string
-	mid      string
-	idLock   sync.RWMutex
-	addr     string
-	errCount int
+	id          string
+	mid         string
+	idLock      sync.RWMutex
+	addr        string
+	writeErrCnt int
 }
 
 func newRTPTransport(conn net.Conn) *RTPTransport {
@@ -221,6 +221,7 @@ func (t *RTPTransport) WriteRTP(rtp *rtp.Packet) error {
 	log.Debugf("RTPTransport.WriteRTP rtp=%v", rtp)
 	writeStream, err := t.rtpSession.OpenWriteStream()
 	if err != nil {
+		t.writeErrCnt++
 		return err
 	}
 
@@ -231,6 +232,10 @@ func (t *RTPTransport) WriteRTP(rtp *rtp.Packet) error {
 	_, err = writeStream.WriteRTP(&rtp.Header, rtp.Payload)
 	if err == nil && t.extSent > 0 {
 		t.extSent--
+	}
+	if err != nil {
+		log.Errorf(err.Error())
+		t.writeErrCnt++
 	}
 	return err
 }
@@ -271,7 +276,7 @@ func (t *RTPTransport) sendPLI() {
 	t.ssrcPTLock.RUnlock()
 }
 
-// SsrcPT playload type and ssrc
+// SSRCPT playload type and ssrc
 func (t *RTPTransport) SSRCPT() map[uint32]uint8 {
 	t.ssrcPTLock.RLock()
 	defer t.ssrcPTLock.RUnlock()
@@ -288,10 +293,6 @@ func (t *RTPTransport) getAddr() string {
 	return t.addr
 }
 
-func (t *RTPTransport) resetExtSent() {
-	t.extSent = extSentInit
-}
-
 func (t *RTPTransport) sendNack(nack *rtcp.TransportLayerNack) {
 	bin, _ := nack.Marshal()
 	t.WriteRawRTCP(bin)
@@ -301,14 +302,10 @@ func (t *RTPTransport) sendREMB(lostRate float64) {
 	return
 }
 
-func (t *RTPTransport) errCnt() int {
-	return t.errCount
+func (t *RTPTransport) writeErrTotal() int {
+	return t.writeErrCnt
 }
 
-func (t *RTPTransport) addErrCnt() {
-	t.errCount++
-}
-
-func (t *RTPTransport) clearErrCnt() {
-	t.errCount = 0
+func (t *RTPTransport) writeErrReset() {
+	t.writeErrCnt = 0
 }

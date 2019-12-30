@@ -10,30 +10,25 @@ import (
 )
 
 const (
-	maxErrCnt       = 100
+	maxWriteErr     = 100
 	maxPipelineSize = 1024
 	jitterBuffer    = "JB"
 )
 
-type middleware interface {
-	ID() string
-	Push(*rtp.Packet) error
-	Stop()
-}
-
 // pipeline is a rtp pipeline
-//                               +----->Transport
-//                               |
-// pub--->middleware1--->...--->out----->Transport
-//                               |
-//                               +----->Transport
-
+// pipline has three loops, in handler and out
+// |-----in-----|-----handler------|---------out---------|
+//                                        +--->sub
+//                                        |
+// pub--->pubCh-->middleware...-->subCh---+--->sub
+//                                        |
+//                                        +--->sub
 type pipeline struct {
 	pub                          Transport
 	sub                          map[string]Transport
 	subLock                      sync.RWMutex
-	handler                      []middleware
-	handlerLock                  sync.RWMutex
+	middlewares                  []middleware
+	middlewareLock               sync.RWMutex
 	pubCh                        chan *rtp.Packet
 	subCh                        chan *rtp.Packet
 	stopInCh, stopMCh, stopOutCh chan struct{}
@@ -117,40 +112,23 @@ func (p *pipeline) out() {
 				if pkt == nil {
 					continue
 				}
+				// nonblock sending
 				go func() {
 					p.subLock.RLock()
-					if len(p.sub) == 0 {
-						p.subLock.RUnlock()
-						return
-					}
 					for _, t := range p.sub {
 						if t == nil {
 							log.Errorf("Transport is nil")
+							continue
 						}
-						switch t.(type) {
-						case *WebRTCTransport:
-							wt := t.(*WebRTCTransport)
-							if err := wt.WriteRTP(pkt); err != nil {
-								log.Errorf("wt.WriteRTP err=%v", err)
-								if wt.errCnt() > maxErrCnt {
-									p.delSub(t.ID())
-								}
-								wt.addErrCnt()
+
+						if err := t.WriteRTP(pkt); err != nil {
+							log.Errorf("wt.WriteRTP err=%v", err)
+							// del sub when err is increasing
+							if t.writeErrTotal() > maxWriteErr {
+								p.delSub(t.ID())
 							}
-							wt.clearErrCnt()
-						case *RTPTransport:
-							rt := t.(*RTPTransport)
-							if err := rt.WriteRTP(pkt); err != nil {
-								log.Errorf("rt.WriteRTP err=%v", err)
-								rt.resetExtSent()
-								if rt.errCnt() > maxErrCnt {
-									p.delSub(t.ID())
-								}
-								rt.addErrCnt()
-							}
-							rt.clearErrCnt()
-							// log.Debugf("send RTP: %v", pkt)
 						}
+						t.writeErrReset()
 					}
 					p.subLock.RUnlock()
 				}()
@@ -261,39 +239,39 @@ func (p *pipeline) delSubs() {
 }
 
 func (p *pipeline) addMiddleware(id string, m middleware) {
-	p.handlerLock.Lock()
-	defer p.handlerLock.Unlock()
-	p.handler = append(p.handler, m)
+	p.middlewareLock.Lock()
+	defer p.middlewareLock.Unlock()
+	p.middlewares = append(p.middlewares, m)
 }
 
 func (p *pipeline) getMiddleware(id string) middleware {
-	p.handlerLock.RLock()
-	defer p.handlerLock.RUnlock()
-	// log.Infof("getMiddleware id=%s handler=%v", id, p.handler)
-	for i := 0; i < len(p.handler); i++ {
-		if p.handler[i].ID() == id {
+	p.middlewareLock.RLock()
+	defer p.middlewareLock.RUnlock()
+	// log.Infof("getMiddleware id=%s handler=%v", id, p.middlewares)
+	for i := 0; i < len(p.middlewares); i++ {
+		if p.middlewares[i].ID() == id {
 			// log.Infof("==id return p ")
-			return p.handler[i]
+			return p.middlewares[i]
 		}
 	}
 	return nil
 }
 
 func (p *pipeline) delMiddleware(id string) {
-	p.handlerLock.Lock()
-	defer p.handlerLock.Unlock()
-	for i := 0; i < len(p.handler); i++ {
-		if p.handler[i].ID() == id {
-			p.handler[i].Stop()
-			p.handler = append(p.handler[:i], p.handler[i+1:]...)
+	p.middlewareLock.Lock()
+	defer p.middlewareLock.Unlock()
+	for i := 0; i < len(p.middlewares); i++ {
+		if p.middlewares[i].ID() == id {
+			p.middlewares[i].Stop()
+			p.middlewares = append(p.middlewares[:i], p.middlewares[i+1:]...)
 		}
 	}
 }
 
 func (p *pipeline) delMiddlewares() {
-	p.handlerLock.Lock()
-	defer p.handlerLock.Unlock()
-	for _, handler := range p.handler {
+	p.middlewareLock.Lock()
+	defer p.middlewareLock.Unlock()
+	for _, handler := range p.middlewares {
 		if handler != nil {
 			handler.Stop()
 		}

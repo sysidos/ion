@@ -96,7 +96,7 @@ func DelSub(mid, id string) {
 	p.delSub(id)
 }
 
-// NewWebRTC new a webrtc transport
+// NewWebRTCTransport new a webrtc transport
 func NewWebRTCTransport(mid, id string, isPub bool) *WebRTCTransport {
 	log.Infof("rtc.NewWebRTCTransport mid=%v id=%v isPub=%v", mid, id, isPub)
 	wt := newWebRTCTransport(mid)

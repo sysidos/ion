@@ -60,7 +60,7 @@ type WebRTCTransport struct {
 	hasVideo     bool
 	hasAudio     bool
 	hasScreen    bool
-	errCount     int
+	writeErrCnt  int
 }
 
 func newWebRTCTransport(id string) *WebRTCTransport {
@@ -172,6 +172,7 @@ func (t *WebRTCTransport) AnswerPublish(rid string, offer webrtc.SessionDescript
 	return answer, err
 }
 
+// AnswerSubscribe answer to sub
 func (t *WebRTCTransport) AnswerSubscribe(offer webrtc.SessionDescription, ssrcPT map[uint32]uint8, mid string) (answer webrtc.SessionDescription, err error) {
 
 	mediaEngine := webrtc.MediaEngine{}
@@ -275,12 +276,20 @@ func (t *WebRTCTransport) WriteRTP(pkt *rtp.Packet) error {
 	t.trackLock.RLock()
 	track := t.track[pkt.SSRC]
 	t.trackLock.RUnlock()
-	if track != nil {
-		log.Debugf("WebRTCTransport.WriteRTP pkt=%v", pkt)
-		return track.WriteRTP(pkt)
+
+	if track == nil {
+		log.Errorf("WebRTCTransport.WriteRTP track==nil pkt.SSRC=%d", pkt.SSRC)
+		return errInvalidTrack
 	}
-	log.Errorf("WebRTCTransport.WriteRTP track==nil pkt.SSRC=%d", pkt.SSRC)
-	return errInvalidTrack
+
+	log.Debugf("WebRTCTransport.WriteRTP pkt=%v", pkt)
+	err := track.WriteRTP(pkt)
+	if err != nil {
+		log.Errorf(err.Error())
+		t.writeErrCnt++
+		return err
+	}
+	return nil
 }
 
 // Close all
@@ -458,7 +467,7 @@ func (t *WebRTCTransport) sendREMB(lostRate float64) {
 		bw = rembHighBW
 	}
 
-	log.Debugf("WebRTCTransport.sendREMB lostRate=%v bw=%v", lostRate, bw*8)
+	log.Infof("WebRTCTransport.sendREMB lostRate=%v bw=%v", lostRate, bw*8)
 	remb := &rtcp.ReceiverEstimatedMaximumBitrate{
 		SenderSSRC: videoSSRC,
 		Bitrate:    bw * 8,
@@ -467,14 +476,10 @@ func (t *WebRTCTransport) sendREMB(lostRate float64) {
 	t.pc.WriteRTCP([]rtcp.Packet{remb})
 }
 
-func (t *WebRTCTransport) errCnt() int {
-	return t.errCount
+func (t *WebRTCTransport) writeErrTotal() int {
+	return t.writeErrCnt
 }
 
-func (t *WebRTCTransport) addErrCnt() {
-	t.errCount++
-}
-
-func (t *WebRTCTransport) clearErrCnt() {
-	t.errCount = 0
+func (t *WebRTCTransport) writeErrReset() {
+	t.writeErrCnt = 0
 }
